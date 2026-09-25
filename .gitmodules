@@ -1,0 +1,4 @@
+[submodule "crates/uoe-ms-auth"]
+	path = crates/uoe-ms-auth
+	url = https://github.com/platinumxy/uoe-ms-auth
+	branch = main
