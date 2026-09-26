@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::mpsc::Sender;
 
 use crate::{
     auth_cache::LoginDetails,
@@ -8,6 +9,7 @@ use crate::{
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
+use edlearn_client::{AuthState, Client};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -19,8 +21,10 @@ pub struct LoginPrompt {
     password: String,
     remember: bool,
     selected: SelectedInput,
-    message: &'static str,
+    message: String,
     events: Rc<EventBus>,
+    otp_response: Option<Sender<String>>,
+    otp: String,
 }
 
 impl LoginPrompt {
@@ -33,7 +37,9 @@ impl LoginPrompt {
             password: String::new(),
             remember: false,
             selected: SelectedInput::Username,
-            message: "",
+            message: String::new(),
+            otp_response: None,
+            otp: String::new(),
         }
     }
 
@@ -46,7 +52,9 @@ impl LoginPrompt {
             password: String::new(),
             remember: false,
             selected: SelectedInput::Username,
-            message,
+            message: message.to_owned(),
+            otp_response: None,
+            otp: String::new(),
         }
     }
 }
@@ -86,7 +94,12 @@ impl Screen for LoginPrompt {
             .block(Block::new().borders(Borders::BOTTOM))
             .alignment(Alignment::Center);
 
-        let message_para = Paragraph::new(self.message)
+        let message = if self.otp_response.is_some() {
+            format!("Enter Microsoft Authenticator OTP: {}", self.otp)
+        } else {
+            self.message.clone()
+        };
+        let message_para = Paragraph::new(message)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false });
 
@@ -97,7 +110,24 @@ impl Screen for LoginPrompt {
         frame.render_widget(message_para, layout[6]);
     }
     fn handle_event(&mut self, event: Event) -> Result<ExitState> {
+        match event {
+            Event::AuthApproval(number) => {
+                self.message = format!("Approve sign-in request: {number}");
+                return Ok(ExitState::Running);
+            }
+            Event::AuthOtp { response } => {
+                self.otp_response = Some(response);
+                self.otp.clear();
+                return Ok(ExitState::Running);
+            }
+            Event::AuthFinished(result) => return self.auth_finished(result),
+            _ => (),
+        }
+
         if let Event::Key(k) = event {
+            if self.otp_response.is_some() {
+                return self.handle_otp_key(k.code);
+            }
             match k.code {
                 // Quit shortcuts
                 KeyCode::Esc => return Ok(ExitState::Quit),
@@ -129,17 +159,11 @@ impl Screen for LoginPrompt {
                 // Submit
                 KeyCode::Enter => {
                     if self.username.is_empty() {
-                        self.message = "Username is empty!";
+                        self.message = "Username is empty!".to_owned();
                     } else if self.password.is_empty() {
-                        self.message = "Password is empty!";
+                        self.message = "Password is empty!".to_owned();
                     } else {
-                        return Ok(ExitState::ChangeScreen(Box::new(MainScreen::new(
-                            self.events.clone(),
-                            LoginDetails {
-                                creds: (self.username.clone(), self.password.clone().into()),
-                                remember: self.remember,
-                            },
-                        ))));
+                        self.start_authentication();
                     }
                 }
 
@@ -148,6 +172,76 @@ impl Screen for LoginPrompt {
         };
 
         Ok(ExitState::Running)
+    }
+}
+
+impl LoginPrompt {
+    fn start_authentication(&mut self) {
+        let username = self.username.clone();
+        let password = self.password.clone();
+        let events = self.events.clone();
+        self.message = "Authenticating...".to_owned();
+
+        events.spawn("microsoft_auth", move |_, event_send| {
+            let client = Client::new((username, password.into()));
+            let approval_send = event_send.clone();
+            let otp_send = event_send.clone();
+            let result = client
+                .authenticate_with_callbacks(
+                    move || {
+                        let (response_send, response_recv) = std::sync::mpsc::channel();
+                        otp_send
+                            .send(Event::AuthOtp {
+                                response: response_send,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        response_recv.recv().map_err(|error| error.to_string())
+                    },
+                    move |number| {
+                        approval_send
+                            .send(Event::AuthApproval(number))
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .map(|_| client.auth_state())
+                .map_err(|error| error.to_string());
+
+            let _ = event_send.send(Event::AuthFinished(result));
+        });
+    }
+
+    fn handle_otp_key(&mut self, code: KeyCode) -> Result<ExitState> {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_digit() => self.otp.push(c),
+            KeyCode::Backspace => {
+                self.otp.pop();
+            }
+            KeyCode::Enter if !self.otp.is_empty() => {
+                if let Some(response) = self.otp_response.take() {
+                    let _ = response.send(std::mem::take(&mut self.otp));
+                }
+            }
+            KeyCode::Esc => return Ok(ExitState::Quit),
+            _ => (),
+        }
+        Ok(ExitState::Running)
+    }
+
+    fn auth_finished(&mut self, result: Result<AuthState, String>) -> Result<ExitState> {
+        match result {
+            Ok(state) => Ok(ExitState::ChangeScreen(Box::new(MainScreen::new(
+                self.events.clone(),
+                LoginDetails {
+                    creds: (self.username.clone(), self.password.clone().into()),
+                    remember: self.remember,
+                    auth_state: Some(state),
+                },
+            )))),
+            Err(error) => {
+                self.message = error;
+                Ok(ExitState::Running)
+            }
+        }
     }
 }
 

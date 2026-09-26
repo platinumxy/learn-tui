@@ -3,36 +3,36 @@
 //! Thank you to @kilolympus and @chaives for figuring out the login process
 //! See: <https://git.tardisproject.uk/kilo/echo360-downloader>
 
-use regex::Regex;
-use reqwest::blocking::Response;
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use thirtyfour::{By, WebDriver};
 use thiserror::Error;
+use url::Url;
 
 use crate::Client;
 
 /// Information used to login
 pub type Credentials = (String, Password);
 
+#[derive(Deserialize)]
+struct BrowserCookie {
+    name: String,
+    value: String,
+    domain: Option<String>,
+    path: Option<String>,
+    secure: Option<bool>,
+    #[serde(rename = "httpOnly")]
+    http_only: Option<bool>,
+}
+
 /// An error encountered when logging in
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("we didn't login for some reason. check your credentials?")]
-    LoginFailed,
+    #[error("microsoft authentication failed: {0}")]
+    MicrosoftAuth(String),
 
-    #[error("couldn't identify the SAMLRequest payload. text: {}", .0)]
-    NoSAMLRequest(String),
-
-    #[error("couldn't identify the SAMLResponse payload. text: {}", .0)]
-    NoSAMLResponse(String),
-
-    #[error("error communicating with learn: {}", .0)]
-    LearnReqError(reqwest::Error),
-
-    #[error("error communicating with EASE: {}", .0)]
-    EaseReqError(reqwest::Error),
-
-    #[error("error communicating with idp: {}", .0)]
-    IDPReqError(reqwest::Error),
+    #[error("couldn't import microsoft authentication cookies: {0}")]
+    CookieImport(String),
 
     #[error("misc I/O error: {}", .0)]
     IOError(#[from] std::io::Error),
@@ -41,83 +41,55 @@ pub enum Error {
 impl Client {
     /// Attempt to authenticate with the set credentials
     pub fn authenticate(&self) -> Result<(), Error> {
-        self.ease_login()?;
-        self.learn_login()?;
-
-        Ok(())
+        self.authenticate_with_callbacks(read_otp, |number| {
+            println!("Approve the sign-in request for code: {number}");
+            Ok(())
+        })
     }
 
-    /// Logs into Ease / Cosign.
-    fn ease_login(&self) -> Result<(), Error> {
-        // Get once to set the cookies
-        self.http
-            .get("https://www.ease.ed.ac.uk/")
-            .send()
-            .and_then(Response::error_for_status)
-            .map_err(Error::EaseReqError)?;
-
-        // Login to CoSign
-        let text = self
-            .http
-            .post("https://www.ease.ed.ac.uk/cosign.cgi")
-            .form(&[
-                ("login", self.creds.0.as_str()),
-                ("password", self.creds.1.as_ref()),
-            ])
-            .send()
-            .and_then(Response::error_for_status)
-            .and_then(|r| r.text())
-            .map_err(Error::EaseReqError)?;
-
-        if !text.contains("/logout/logout.cgi") {
-            return Err(Error::LoginFailed);
+    /// Authenticate with Microsoft while letting the caller own user prompts.
+    pub fn authenticate_with_callbacks<OTP, APPROVAL>(
+        &self,
+        mut otp_provider: OTP,
+        mut approval_notifier: APPROVAL,
+    ) -> Result<(), Error>
+    where
+        OTP: FnMut() -> Result<String, String> + Send + 'static,
+        APPROVAL: FnMut(u64) -> Result<(), String> + Send + 'static,
+    {
+        let username = self.creds.0.clone();
+        let password = self.creds.1.as_ref().to_owned();
+        if !username.ends_with("@ed.ac.uk") {
+            return Err(Error::MicrosoftAuth(
+                "username must end with @ed.ac.uk".to_owned(),
+            ));
+        }
+        if password.is_empty() {
+            return Err(Error::MicrosoftAuth(
+                "password must not be empty".to_owned(),
+            ));
         }
 
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|error| Error::MicrosoftAuth(error.to_string()))?;
+        let cookies = authenticate_with_browser(
+            &mut otp_provider,
+            &mut approval_notifier,
+            username,
+            password,
+            runtime,
+        )?;
+
+        self.import_auth_cookies(&cookies)?;
         Ok(())
     }
 
-    // Logs into learn by performing the SAML request to the IDP
-    fn learn_login(&self) -> Result<(), Error> {
-        // Initiates the login process
-        const LEARN_LOGIN_URL: &str = "https://www.learn.ed.ac.uk/auth-saml/saml/login?apId=_175_1&redirectUrl=https%3A%2F%2Fwww.learn.ed.ac.uk%2Fultra";
-        const SSO_SAML_URL: &str = "https://idp.ed.ac.uk/idp/profile/SAML2/POST/SSO";
-        const LEARN_CALLBACK_URL: &str =
-            "https://www.learn.ed.ac.uk/auth-saml/saml/SSO/alias/_175_1";
-        let text = self
-            .http
-            .get(LEARN_LOGIN_URL)
-            .send()
-            .and_then(Response::error_for_status)
-            .and_then(|r| r.text())
-            .map_err(Error::LearnReqError)?;
+    fn import_auth_cookies(&self, cookies: &str) -> Result<(), Error> {
+        let browser_cookies: Vec<BrowserCookie> = serde_json::from_str(cookies)
+            .map_err(|error| Error::CookieImport(error.to_string()))?;
+        let store = self.cookies.write().unwrap();
 
-        let samlreq_re = Regex::new(r#"name="SAMLRequest" value="([^"]*)""#).unwrap();
-        let Some(caps) = samlreq_re.captures(&text) else {
-            return Err(Error::NoSAMLRequest(text));
-        };
-        let samlreq = &caps[1];
-
-        // Authn Request
-        let text = self
-            .http
-            .post(SSO_SAML_URL)
-            .form(&[("SAMLRequest", samlreq)])
-            .send()
-            .and_then(Response::error_for_status)
-            .and_then(|t| t.text())
-            .map_err(Error::IDPReqError)?;
-        let samlresp_re = Regex::new(r#"name="SAMLResponse" value="([^"]*)""#).unwrap();
-        let Some(caps) = samlresp_re.captures(&text) else {
-            return Err(Error::NoSAMLResponse(text));
-        };
-        let samlresp = &caps[1];
-
-        self.http
-            .post(LEARN_CALLBACK_URL)
-            .form(&[("SAMLResponse", samlresp)])
-            .send()
-            .and_then(Response::error_for_status)
-            .map_err(Error::LearnReqError)?;
+        extract_cookies(browser_cookies, store)?;
 
         Ok(())
     }
@@ -132,6 +104,127 @@ impl Client {
             .unwrap();
         AuthState(ser)
     }
+}
+
+fn extract_cookies(
+    browser_cookies: Vec<BrowserCookie>,
+    mut store: std::sync::RwLockWriteGuard<'_, reqwest_cookie_store::CookieStore>,
+) -> Result<(), Error> {
+    Ok(for cookie in browser_cookies {
+        let domain = cookie
+            .domain
+            .ok_or_else(|| Error::CookieImport(format!("cookie {} has no domain", cookie.name)))?;
+        let url = Url::parse(&format!(
+            "https://{}{}",
+            domain.trim_start_matches('.'),
+            cookie.path.as_deref().unwrap_or("/")
+        ))
+        .map_err(|error| Error::CookieImport(error.to_string()))?;
+        let mut raw = format!(
+            "{}={}; Domain={}; Path={}",
+            cookie.name,
+            cookie.value,
+            domain,
+            cookie.path.as_deref().unwrap_or("/")
+        );
+        if cookie.secure.unwrap_or(false) {
+            raw.push_str("; Secure");
+        }
+        if cookie.http_only.unwrap_or(false) {
+            raw.push_str("; HttpOnly");
+        }
+        let parsed = reqwest_cookie_store::RawCookie::parse(&raw)
+            .map_err(|error| Error::CookieImport(error.to_string()))?;
+        store
+            .insert_raw(&parsed, &url)
+            .map_err(|error| Error::CookieImport(error.to_string()))?;
+    })
+}
+
+fn authenticate_with_browser<OTP, APPROVAL>(
+    otp_provider: &mut OTP,
+    approval_notifier: &mut APPROVAL,
+    username: String,
+    password: String,
+    runtime: tokio::runtime::Runtime,
+) -> Result<String, Error>
+where
+    OTP: FnMut() -> Result<String, String> + Send + 'static,
+    APPROVAL: FnMut(u64) -> Result<(), String> + Send + 'static,
+{
+    let cookies = runtime.block_on(async {
+        let driver = uoe_ms_auth::create_driver()
+            .await
+            .map_err(|error| Error::MicrosoftAuth(error.to_string()))?;
+        let mut state = uoe_ms_auth::AuthState::Init;
+
+        while !state.exit_state() {
+            state = match state {
+                uoe_ms_auth::AuthState::CredsPrompt { .. } => uoe_ms_auth::AuthState::CredsPrompt {
+                    username: Some(username.clone()),
+                    password: Some(password.clone()),
+                },
+                uoe_ms_auth::AuthState::ApproveAppNotif(number) => {
+                    approval_notifier(number).map_err(Error::MicrosoftAuth)?;
+                    uoe_ms_auth::AuthState::ApproveAppNotif(number)
+                }
+                uoe_ms_auth::AuthState::PhoneOTP(_) => uoe_ms_auth::AuthState::PhoneOTP(Some(
+                    otp_provider().map_err(Error::MicrosoftAuth)?,
+                )),
+                state => state,
+            };
+
+            state = uoe_ms_auth::step_auth_sm(&driver, state)
+                .await
+                .map_err(|error| Error::MicrosoftAuth(error.to_string()))?
+        }
+
+        if state != uoe_ms_auth::AuthState::Authenticated {
+            return Err(Error::MicrosoftAuth(format!(
+                "authentication ended in {state:?}"
+            )));
+        }
+        authenticate_learn(&driver)
+            .await
+            .map_err(|error| Error::MicrosoftAuth(error.to_string()))?;
+
+        Ok::<_, Error>(
+            uoe_ms_auth::cookies_from(
+                &driver,
+                vec![
+                    "edadfed.ed.ac.uk",
+                    "exampapers.ed.ac.uk",
+                    "idp.ed.ac.uk",
+                    "www.learn.ed.ac.uk",
+                    "login.live.com",
+                    "login.microsoft.com",
+                    "login.microsoftonline.com",
+                ],
+            )
+            .await,
+        )
+    })?;
+    Ok(cookies)
+}
+
+async fn authenticate_learn(driver: &WebDriver) -> Result<(), thirtyfour::error::WebDriverError> {
+    driver.goto("https://www.learn.ed.ac.uk/").await?;
+
+    if let Ok(login) = driver.find(By::ClassName("easelogin-bt")).await {
+        login.click().await?;
+    }
+
+    Ok(())
+}
+
+fn read_otp() -> Result<String, String> {
+    print!("Please enter an OTP from your Microsoft Authenticator app: ");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut otp = String::new();
+    io::stdin()
+        .read_line(&mut otp)
+        .map_err(|error| error.to_string())?;
+    Ok(otp.trim().to_owned())
 }
 
 /// Contains cached authentication cookies

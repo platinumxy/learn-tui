@@ -68,13 +68,15 @@ pub struct MainScreen {
 impl MainScreen {
     /// Create a new app using the given event bus and login details
     pub fn new(events: Rc<EventBus>, login_details: LoginDetails) -> Self {
-        let client = match AuthCache::load() {
-            Ok(c) => c.into_client().unwrap(),
-            Err(e) => {
-                debug!("error loading config: {:?}", e);
-
-                Client::new(login_details.creds)
-            }
+        let client = match login_details.auth_state {
+            Some(state) => Client::with_auth_state(login_details.creds.clone(), state).unwrap(),
+            None => match AuthCache::load() {
+                Ok(c) => c.into_client().unwrap(),
+                Err(e) => {
+                    debug!("error loading config: {:?}", e);
+                    Client::new(login_details.creds.clone())
+                }
+            },
         };
 
         Self {

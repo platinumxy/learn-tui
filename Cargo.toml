@@ -5,6 +5,7 @@ members = [
     "crates/tui",
     "crates/bbml"
 ]
+default-run = "edlearn_tui"
 
 [workspace.dependencies]
 serde = { version = "1.0.193", features = ["derive"] }

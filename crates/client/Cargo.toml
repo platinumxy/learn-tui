@@ -14,9 +14,12 @@ license = "GPL-3.0-only"
 [dependencies]
 chrono = { version = "0.4.31", features = ["serde"] }
 log = { workspace = true }
-regex = "1.10.2"
 reqwest = { version = "0.11.24", features = ["blocking", "cookies",  "json"] }
 reqwest_cookie_store = "0.6.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "1.0.51"
+thirtyfour = "0.37.5"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+uoe-ms-auth = { path = "../uoe-ms-auth", default-features = false, features= ["show-browser"] }
+url = "2.5.7"

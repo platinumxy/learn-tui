@@ -23,6 +23,15 @@ pub enum Event {
     /// Terminal resize.
     Resize(u16, u16),
 
+    /// Microsoft Authenticator approval number.
+    AuthApproval(u64),
+
+    /// Microsoft requested a one-time password.
+    AuthOtp { response: Sender<String> },
+
+    /// Authentication completed in the worker thread.
+    AuthFinished(Result<edlearn_client::AuthState, String>),
+
     /// Some data for the store, sent by the worker.
     Store(store::Event),
 }

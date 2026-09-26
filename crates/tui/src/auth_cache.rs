@@ -1,4 +1,7 @@
-use std::{env, fs::{remove_file, File, create_dir_all}};
+use std::{
+    env,
+    fs::{create_dir_all, remove_file, File},
+};
 
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8PathBuf;
@@ -39,6 +42,7 @@ impl AuthCache {
         Ok(())
     }
 
+    /// Load the authentication cache from disk
     pub fn load() -> Result<Self> {
         let path = state_file_location()?;
         let file = File::open(path).context("error opening auth cache")?;
@@ -70,7 +74,7 @@ fn state_file_location() -> Result<Utf8PathBuf> {
         home.push(".state");
         home.try_into().expect("non utf8 path")
     };
-    
+
     out.push(FILE_NAME);
 
     Ok(out)
@@ -91,7 +95,7 @@ fn state_file_location() -> Result<Utf8PathBuf> {
         home.push("Local");
         home.try_into().expect("non utf8 path")
     };
-    
+
     out.push(FILE_NAME);
 
     Ok(out)
@@ -102,4 +106,5 @@ fn state_file_location() -> Result<Utf8PathBuf> {
 pub struct LoginDetails {
     pub creds: Credentials,
     pub remember: bool,
+    pub auth_state: Option<AuthState>,
 }

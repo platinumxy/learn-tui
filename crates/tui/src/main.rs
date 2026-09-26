@@ -70,6 +70,7 @@ fn run_in_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             LoginDetails {
                 creds: a.creds,
                 remember: true,
+                auth_state: None,
             },
         )),
         Err(_) => Box::new(LoginPrompt::new(bus.clone())),
