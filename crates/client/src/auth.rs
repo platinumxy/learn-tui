@@ -4,7 +4,7 @@
 //! See: <https://git.tardisproject.uk/kilo/echo360-downloader>
 
 use serde::{Deserialize, Serialize};
-use std::{io::{self, Write}, time::Duration};
+use std::{io::{self, Write}, sync::{Mutex, TryLockError}, time::Duration};
 use thirtyfour::{By, WebDriver};
 use thiserror::Error;
 use url::Url;
@@ -13,6 +13,8 @@ use crate::Client;
 
 /// Information used to login
 pub type Credentials = (String, Password);
+
+static LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Deserialize)]
 struct BrowserCookie {
@@ -33,9 +35,15 @@ pub enum Error {
 
     #[error("microsoft authentication failed: {0}")]
     MicrosoftAuth(String),
-
+    
     #[error("couldn't import microsoft authentication cookies: {0}")]
     CookieImport(String),
+    
+    #[error("couldn't update status: {0}")]
+    StatusError(String),
+
+    #[error("Already locked in state: {0}")]
+    LockedError(String),
 
     #[error("misc I/O error: {}", .0)]
     IOError(#[from] std::io::Error),
@@ -66,6 +74,13 @@ impl Client {
         APPROVAL: FnMut(u64) -> Result<(), String>,
         STATUS: FnMut(&'static str) -> Result<(), String>,
     {
+        let _lock = LOCK.try_lock().map_err(|e| {
+            Error::LockedError(match e {
+                TryLockError::WouldBlock => "auth in progress",
+                TryLockError::Poisoned(_) => "lock is poisoned"
+            }.to_owned())
+        })?;
+
         let username = self.creds.0.clone();
         let password = self.creds.1.as_ref().to_owned();
         if !username.ends_with("@ed.ac.uk") {
@@ -264,7 +279,8 @@ pub struct AuthState(pub(crate) Vec<u8>);
 
 impl std::fmt::Debug for AuthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AuthState (***)")
+        write!(f, "AuthState (***)")?;
+        Ok(())
     }
 }
 
@@ -273,7 +289,8 @@ impl std::fmt::Debug for AuthState {
 pub struct Password(String);
 impl std::fmt::Debug for Password {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Password (******)")
+        write!(f, "Password (******)")?;
+        Ok(())
     }
 }
 
