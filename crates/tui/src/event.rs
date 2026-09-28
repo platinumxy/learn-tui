@@ -26,6 +26,9 @@ pub enum Event {
     /// Microsoft Authenticator approval number.
     AuthApproval(u64),
 
+    /// Authentication progress message.
+    AuthStatus(&'static str),
+
     /// Microsoft requested a one-time password.
     AuthOtp { response: Sender<String> },
 

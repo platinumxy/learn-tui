@@ -111,6 +111,10 @@ impl Screen for LoginPrompt {
     }
     fn handle_event(&mut self, event: Event) -> Result<ExitState> {
         match event {
+            Event::AuthStatus(message) => {
+                self.message = message.to_owned();
+                return Ok(ExitState::Running);
+            }
             Event::AuthApproval(number) => {
                 self.message = format!("Approve sign-in request: {number}");
                 return Ok(ExitState::Running);
@@ -186,6 +190,7 @@ impl LoginPrompt {
             let client = Client::new((username, password.into()));
             let approval_send = event_send.clone();
             let otp_send = event_send.clone();
+            let status_send = event_send.clone();
             let result = client
                 .authenticate_with_callbacks(
                     move || {
@@ -200,6 +205,11 @@ impl LoginPrompt {
                     move |number| {
                         approval_send
                             .send(Event::AuthApproval(number))
+                            .map_err(|error| error.to_string())
+                    },
+                    move |message| {
+                        status_send
+                            .send(Event::AuthStatus(message))
                             .map_err(|error| error.to_string())
                     },
                 )
